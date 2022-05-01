@@ -14,17 +14,17 @@ from pipelines.pipeline.exceptions import PipelineError
 from schema import SchemaError
 from yaml import YAMLError
 from concurrent.futures import ThreadPoolExecutor
-from tornado import gen
+from tornado import concurrent, gen, ioloop
+from tornado.httputil import url_concat
 from tornado.ioloop import IOLoop
-from tornado import concurrent, ioloop
 from tornado.web import (
     RequestHandler,
     Application,
-    url,
     HTTPError,
     authenticated,
     StaticFileHandler
 )
+from tornado.routing import PathMatches, Rule
 from pipelines import PipelinesError
 from pipelines.api import PIPELINES_EXT, WEB_HOOK_CONFIG
 from pipelines.api.ghauth import GithubOAuth2LoginHandler
@@ -183,8 +183,13 @@ class LoginHandler(PipelinesRequestHandler):
     def get(self):
         log.debug('Login page %s.' % self.settings['auth'])
         login_type = self.settings['auth'].get('type') if self.settings['auth'] else None
+
+        ghauth_url = url_concat(
+            self.reverse_url('ghauth'), dict(prefix=self.settings['prefix']))
+
         self.render(
             'templates/login.html',
+            ghauth_url=ghauth_url,
             error_msg=None,
             login_type=login_type
         )
@@ -197,7 +202,8 @@ class LoginHandler(PipelinesRequestHandler):
         ):
             self.set_secure_cookie("user", tornado.escape.json_encode(self.get_argument("username")))
             print('set secure cookie')
-            self.redirect("/index.html")
+            index = '{}/'.format(self.settings['prefix'])
+            self.redirect(index)
         else:
             self.render(
                 'templates/login.html',
@@ -386,8 +392,33 @@ class RunPipelineHandler(PipelinesRequestHandler):
 class AuthStaticFileHandler(StaticFileHandler, PipelinesRequestHandler):
     @authenticated
     def get(self, *args, **kwargs):
+        filename = args[0]
+        log.debug('filename: %s', filename)
+        if not filename:
+
+            self.path = self.parse_url_path(filename)
+            # del path  # make sure we don't refer to path instead of self.path again
+            absolute_path = self.get_absolute_path(self.root, self.path)
+            self.absolute_path = self.validate_absolute_path(
+                self.root, absolute_path)
+            if self.absolute_path is None:
+                return
+
+            return self.render(
+                _get_static_path('app') + '/index.html',
+                api_base=self.application.reverse_url('api_base'),
+                prefix=self.settings['prefix'])
         return super(AuthStaticFileHandler, self).get(*args, **kwargs)
 
+
+class HomeRedirectHandler(RequestHandler):
+
+    def initialize(self, prefix):
+        self.prefix = prefix
+
+    def get(self):
+        prefix = self.prefix.rstrip('/') + '/'
+        return self.redirect(prefix)
 
 def _get_auth_dict(auth_settings):
     if not auth_settings or len(auth_settings) == 0:
@@ -408,8 +439,13 @@ def _get_auth_dict(auth_settings):
 
 
 def make_app(
-        cookie_secret=None, workspace='fixtures/workspace',
-        title='Pipelines', auth=None, history_limit=0):
+        cookie_secret=None,
+        workspace='fixtures/workspace',
+        title='Pipelines',
+        auth=None,
+        history_limit=0,
+        prefix='/'):
+
     if cookie_secret is None:
         raise PipelineError('Cookie secret can not be empty')
 
@@ -420,29 +456,52 @@ def make_app(
 
     slug_regexp = '[0-9a-zA-Z_\-]+'
     endpoints = [
-        url(r"/api/pipelines/", GetPipelinesHandler),
-        url(r"/api/pipelines/({slug})/".format(slug=slug_regexp), GetPipelineHandler),
-        url(r"/api/pipelines/({slug})/run".format(slug=slug_regexp), RunPipelineHandler),
-        url(r"/api/pipelines/({slug})/({slug})/status".format(slug=slug_regexp), GetStatusHandler),
-        url(r"/api/pipelines/({slug})/({slug})/log".format(slug=slug_regexp), GetLogsHandler),
-        url(r"/api/pipelines/({slug})/triggers".format(slug=slug_regexp), GetTriggersHandler),
-        url(r"/api/webhook/({slug})".format(slug=slug_regexp), WebhookHandler),
-        url(r"/api/slackbot/({slug})".format(slug=slug_regexp), SlackbotHandler),
-        (r"/login", LoginHandler),
-        (r'/(.*)', AuthStaticFileHandler, {'path': _get_static_path('app'), "default_filename": "index.html"}),
+        Rule(PathMatches(
+            r"/api/pipelines/"),
+            GetPipelinesHandler, name='api_base'),
+        Rule(PathMatches(
+            r"/api/pipelines/({slug})/".format(slug=slug_regexp)),
+            GetPipelineHandler),
+        Rule(PathMatches(
+            r"/api/pipelines/({slug})/run".format(slug=slug_regexp)),
+            RunPipelineHandler),
+        Rule(PathMatches(
+            r"/api/pipelines/({slug})/({slug})/status".format(slug=slug_regexp)),
+            GetStatusHandler),
+        Rule(PathMatches(
+            r"/api/pipelines/({slug})/({slug})/log".format(slug=slug_regexp)),
+            GetLogsHandler),
+        Rule(PathMatches(
+            r"/api/pipelines/({slug})/triggers".format(slug=slug_regexp)),
+             GetTriggersHandler),
+        Rule(PathMatches(
+            r"/api/webhook/({slug})".format(slug=slug_regexp)), WebhookHandler),
+        Rule(PathMatches(
+            r"/api/slackbot/({slug})".format(slug=slug_regexp)),
+             SlackbotHandler),
+        Rule(PathMatches(r"/login"), LoginHandler, name='login'),
+        Rule(PathMatches(r'/(.*)'), AuthStaticFileHandler,
+             {'path': _get_static_path('app'),
+              "default_filename": "index.html"}),
     ]
 
     if auth_dict and auth_dict.get('type') == 'gh':
-        endpoints.insert(len(endpoints) - 1, (r"/ghauth", GithubOAuth2LoginHandler)),
+        hdl = Rule(
+            PathMatches('/ghauth'), GithubOAuth2LoginHandler, name='ghauth')
+        endpoints.insert(len(endpoints) - 1, hdl)
+
+    # prefix support
+    login_url, endpoints = add_prefix_to_handlers(prefix, auth_dict, endpoints)
 
     return Application(endpoints,
                        title=title,
                        workspace_path=workspace,
                        auth=auth_dict,
-                       login_url="/login",
+                       login_url=login_url,
                        debug="True",
                        cookie_secret=cookie_secret,
                        history_limit=history_limit,
+                       prefix=prefix.rstrip('/'),
                        )
 
 
@@ -461,15 +520,62 @@ def _hide_pw(conf_dict):
     out['cookie_secret'] = '*******'
     return out
 
+def add_prefix_to_handlers(prefix, auth_dict, handlers):
+    login_url = "/login"
+    if prefix == '/':
+        return login_url, handlers
+
+    prefix = prefix.rstrip('/')
+    login_url = '{}/{}'.format(prefix, login_url.lstrip('/'))
+
+    for i in range(len(handlers)):
+        hdl = handlers[i]
+        if isinstance(hdl, Rule):
+            # log.debug(hdl.matcher.regex.pattern)
+            ptn = '{}/{}'.format(prefix, hdl.matcher.regex.pattern.lstrip('/'))
+            tgt = hdl.target
+            kwargs = hdl.target_kwargs
+            name = hdl.name
+            hdl = Rule(PathMatches(ptn), tgt, kwargs, name)
+            # log.debug("  routing %s to %s", hdl.matcher.regex.pattern, tgt)
+        else:
+            if isinstance(hdl[0], re.Pattern):
+                # log.debug(hdl[0].pattern)
+                hdl[0] = re.compile(
+                    '{}/{}'.format(prefix, hdl[0].pattern.lstrip('/')))
+                # log.debug(hdl[0].pattern)
+                # log.debug("  routing %s to %s", hdl[0].pattern, hdl[1])
+            else:
+                # log.debug(hdl[0])
+                if isinstance(hdl, list):
+                    hdl[0] = '{}/{}'.format(prefix, hdl[0].lstrip('/'))
+                if isinstance(hdl, tuple):
+                    hdl = tuple([
+                        '{}/{}'.format(prefix, hdl[0].lstrip('/'))] +
+                                list(hdl[1:]))
+                else:
+                    raise RuntimeError()
+                # log.debug("  routing %s to %s", hdl[0], hdl[1])
+        handlers[i] = hdl
+
+    handlers.insert(
+        len(handlers), ('/', HomeRedirectHandler, dict(prefix=prefix)))
+
+    return login_url, handlers
+
 
 def main(config):
-    conf_logging()
+    lvl = logging.INFO
+    if config.get('debug'):
+        lvl = logging.DEBUG
+    conf_logging(lvl)
     app = make_app(
         cookie_secret=config.get('cookie_secret'),
         workspace=config.get('workspace', 'fixtures/workspace'),
         title=config.get('title'),
         auth=config.get('auth'),
         history_limit=config.get('history_limit'),
+        prefix=config.get('web_path'),
     )
     app.listen(
         int(config.get('port', 8888)),

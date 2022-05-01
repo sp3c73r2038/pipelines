@@ -6,7 +6,6 @@ import json
 from urllib.parse import urlencode
 import logging
 import tornado
-import requests
 from tornado.concurrent import return_future
 from tornado.web import RequestHandler
 from tornado.auth import _auth_return_future, AuthError
@@ -124,14 +123,13 @@ class GithubOAuth2Mixin(object):
             url += "?" + urlencode(all_args)
         callback = functools.partial(self._on_github_request, callback)
         http = self.get_auth_http_client()
-        ua = "tornado"
         if post_args is not None:
             http.fetch(url, method="POST", body=urlencode(post_args),
-                       callback=callback, user_agent=ua,
+                       callback=callback,
                        headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
                        auth_mode='basic', auth_username='_', auth_password=access_token)
         else:
-            http.fetch(url, method="GET", callback=callback, user_agent=ua,
+            http.fetch(url, method="GET", callback=callback,
                        headers={"Accept": "application/json"}, auth_mode='basic',
                        auth_username='_', auth_password=access_token)
 
@@ -146,7 +144,30 @@ class GithubOAuth2Mixin(object):
 
     @staticmethod
     def get_auth_http_client():
+        impl = 'tornado.simple_httpclient.SimpleAsyncHTTPClient'
+        # debug support
+        proxy_host = os.environ.get("PROXY_HOST")
+        proxy_port = os.environ.get("PROXY_PORT")
+        defaults = {
+            'user_agent': 'tornado',
+        }
+        if proxy_host and proxy_port:
+            log.debug('>> enable proxy support for tornado.httpclient')
+            log.debug('>> proxy: %s:%s', proxy_host, proxy_port)
+            # as for torado 6.0, proxy is only supported in
+            # curl_httpclient, need to install pycurl
+            defaults.update({
+                'proxy_host': proxy_host,
+                'proxy_port': int(proxy_port),
+            })
+            impl = 'tornado.curl_httpclient.CurlAsyncHTTPClient'
+
+        httpclient.AsyncHTTPClient.configure(
+            impl=impl,
+            defaults=defaults)
+
         return httpclient.AsyncHTTPClient()
+
 
 class GithubOAuth2LoginHandler(RequestHandler,
                                GithubOAuth2Mixin):
@@ -173,11 +194,9 @@ class GithubOAuth2LoginHandler(RequestHandler,
                 callback=cb
             )
 
-            # r = requests.get('https://api.github.com/user/teams?access_token=%s' % user['access_token'])
-
             if not user or not user.get('access_token'):
                 log.debug('Auth failed, missing access_token')
-                self.redirect('/login')
+                self.redirect(self.reverse_url('login'))
                 return
 
             username = user.get('login')
@@ -186,15 +205,18 @@ class GithubOAuth2LoginHandler(RequestHandler,
                 self.redirect('/login')
                 return
 
-            r = requests.get('https://api.github.com/user/teams', auth=('_', user['access_token']))
-
+            resp = yield self.get_auth_http_client().fetch(
+                'https://api.github.com/user/teams', method="GET", callback=cb,
+                headers={"Accept": "application/json"},
+                auth_mode='basic', auth_username='_',
+                auth_password=user['access_token'])
 
             allowed_teams = self.settings['auth'].get('teams', [])
             allowed_teams_set = set()
             for org, team in allowed_teams:
                 allowed_teams_set.add((org.lower(), team.lower()))
             log.debug('Allowed teams: %s' % allowed_teams_set)
-            teams = r.json()
+            teams = json.loads(resp.body)
 
             user_teams_set = set()
             for x in teams:

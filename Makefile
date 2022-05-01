@@ -12,6 +12,12 @@
 PY := python3
 VENV := .venv
 VENV_BIN := ${VENV}/bin
+GH_OAUTH_KEY :=
+GH_OAUTH_SECRET :=
+
+# used in ghauth handler
+PROXY_HOST :=
+PROXY_PORT :=
 
 API_SERVER_ARGS := server --workspace=test/fixtures/workspace --host 0.0.0.0
 
@@ -35,7 +41,9 @@ install: ${VENV}
 	${VENV}/bin/pipenv install
 
 run:
-	${VENV}/bin/python -m pipelines ${API_SERVER_ARGS}
+	GH_OAUTH_KEY=${GH_OAUTH_KEY} GH_OAUTH_SECRET=${GH_OAUTH_SECRET} \
+		PROXY_HOST=${PROXY_HOST} PROXY_PORT=${PROXY_PORT} \
+		${VENV}/bin/python -m pipelines ${API_SERVER_ARGS}
 
 test:
 	# PYTHONPATH=./pipelines $(NOSETESTS) -d -v -w test/*
